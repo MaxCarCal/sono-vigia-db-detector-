@@ -1,117 +1,294 @@
-# SonoVigía FPGA — RTL completo (DE10-Lite, 10M50DAF484C7G)
+# SonoVigía FPGA
 
-## Estructura
+**Monitor de nivel sonoro en dB(A) con alerta de ruido excesivo para zonas residenciales, escrito por completo en Verilog sobre una FPGA. Proyecto final de Sistemas Embebidos, UDLAP, otoño de 2026.**
 
-```
-rtl/      23 módulos Verilog (sintetizables, salvo adc_model.v)
-tb/       19 testbenches autoverificables (imprimen PASS / FAIL)
-model/    modelo Python bit-exacto + generadores (coeficientes, ROM, TBs, pines)
-quartus/  sonovigia.sdc (tiempos) y sonovigia_pins.tcl (pines del manual)
+| | |
+|---|---|
+| **Equipo** | Maximiliano Carmona Canales (184486) · Maylin Espinosa Andrade (186109) |
+| **Profesor** | _[nombre del profesor]_ |
+| **Tarjeta** | Terasic DE10-Lite (Intel MAX 10 10M50DAF484C7G) |
+| **Herramientas** | Quartus Prime Lite 21.1 · Active-HDL · Python 3 (modelo de referencia) |
+
+## Resumen
+
+El ruido de vecinos es una de las causas más comunes de conflicto en zonas habitacionales. En México, la NOM-081-SEMARNAT-1994 fija para zonas residenciales un límite de **55 dB(A) de 06:00 a 22:00** y **50 dB(A) de 22:00 a 06:00**, con hasta 100 dB(A) durante 4 h en eventos. Aun así, la mayoría de las quejas se basan en la percepción, porque un sonómetro certificado es caro y casi nunca está disponible cuando ocurre el ruido.
+
+SonoVigía es un sonómetro digital de bajo costo. Un micrófono MAX4466 entra por la entrada analógica A0 de la DE10-Lite, y la FPGA hace todo lo demás en hardware: muestrea a 1 MS/s, filtra, aplica la ponderación A, calcula el nivel en dB(A) sin logaritmos ni raíces y decide si se rebasa el límite. No hay procesador ni software dentro de la tarjeta.
+
+- **Mide** el nivel en dB(A) con respuesta Fast (125 ms) o Slow (1 s), como un sonómetro real.
+- **Avisa** con una máquina de estados que solo alerta si el límite se rebasa **3 s seguidos**, para que un portazo no dispare la alarma.
+- **Registra** un nivel por segundo durante 24 h en la memoria interna, sin guardar nunca el audio.
+
+```mermaid
+flowchart LR
+    MIC["Micrófono MAX4466<br/>pin A0"] --> ADC["adc_qsys<br/>ADC 12 bits, 1 MS/s"]
+    ADC --> IF["adc_if<br/>10 MHz → 50 MHz"]
+    IF --> CIC["cic_dec<br/>÷40 → 25 kS/s"]
+    CIC --> DC["dc_block<br/>quita DC"]
+    DC --> AW["a_weight_iir<br/>ponderación A"]
+    AW --> MS["ms_avg<br/>Σy², 125 ms / 1 s"]
+    MS --> DB["db_lut<br/>Σy² → dB(A)"]
+    DB --> AL["alarm_fsm<br/>HEX4, buzzer"]
+    DB --> LB["led_bar<br/>LEDR0–9"]
+    DB --> DP["disp_ctrl<br/>HEX0–HEX5"]
+    DB --> LG["lvl_log + log_uart<br/>24 h, UART"]
+    TOD["tod_clock<br/>hora y límite"] --> AL
 ```
 
-## Cadena y módulos
+## Cómo se usa
 
+### Conexión física
+
+| Módulo MAX4466 | DE10-Lite (header Arduino) | Función |
+|---|---|---|
+| VCC | 5V | Alimentación; la salida queda centrada en 2.5 V |
+| GND | GND | Tierra común |
+| OUT | A0 (ADC_IN0) | Señal de audio |
+
+La DE10-Lite reduce 0–5 V en A0 a 0–2.5 V para el ADC, así que el voltaje en el pin se calcula como:
+
+$$V_{A0} = \frac{\text{código}}{4095} \times 5.0\ \text{V}$$
+
+### Controles
+
+| Control | Valores | Función |
+|---|---|---|
+| SW1 SW0 | 00 / 01 / 10 / 11 | Límite: automático día/noche · día 55 · noche 50 · evento 100 dB durante 4 h |
+| SW2 | 0 / 1 | Respuesta Fast (125 ms) o Slow (1 s) |
+| SW3 | 0 / 1 | Habilita el buzzer |
+| SW5 SW4 | 00 / 01 / 10 / 11 | Display: nivel · Lmax · reloj · raw (calibración) |
+| SW6 | 0 / 1 | Al ajustar el reloj, KEY1 suma 1 hora o 1 minuto |
+| SW9 SW8 SW7 | 000 … 111 | Ajuste fino de calibración, −4 a +3 dB (complemento a 2) |
+| KEY0 | — | Reset |
+| KEY1 | — | En modo reloj ajusta la hora; en otro modo borra Lmax y silencia la alerta |
+
+### Qué se ve en la tarjeta
+
+| Indicador | Muestra | Detalle |
+|---|---|---|
+| HEX5 | Límite activo | `d` día · `n` noche · `E` evento |
+| HEX4 | Estado de la alarma | `-` monitor · `P` pre-alerta · `A` alerta (parpadea) · `C` cooldown |
+| HEX3 | Sobrecarga | `o` si el ADC se saturó en el último segundo |
+| HEX2–HEX0 | Valor | Nivel, Lmax (`H`), hora `HH.MM` o raw (`r`), según SW5 SW4 |
+| LEDR0–LEDR9 | Barra de nivel | LEDR*i* enciende desde 45 + 6·*i* dB (45 a 99 dB) |
+
+### Parámetros del diseño
+
+| Parámetro | Valor | Dónde se cambia | Por qué |
+|---|---|---|---|
+| Muestreo del ADC | 1 MS/s, 12 bits | IP `adc_core` | Máximo del ADC del MAX 10 |
+| Tasa después del CIC | 25 kS/s | `cic_dec` (R = 40) | Suficiente para audio hasta 10 kHz |
+| Ventana Fast | 125 ms (3125 muestras) | `ms_avg` | Equivale a la respuesta Fast de un sonómetro |
+| Ventana Slow | 1 s (8 bloques) | `ms_avg` | Equivale a la respuesta Slow; da el LAeq de 1 s |
+| Límite de día / noche / evento | 55 / 50 / 100 dB(A) | `tod_clock` (`LIM_DAY`, `LIM_NIGHT`, `LIM_EVENT`) | NOM-081, zona residencial |
+| Horario nocturno | 22:00 a 06:00 | `tod_clock` (`NIGHT_START`, `NIGHT_END`) | NOM-081 |
+| Duración del modo evento | 14,400 s (4 h) | `tod_clock` (`EVENT_S`) | NOM-081, eventos |
+| Tiempo de sostén | 3 s | `sonovigia_top` (`HOLD_S`) | Evita alarmas por ruidos breves |
+| Margen de pre-alerta | 3 dB | `alarm_fsm` (`PRE_MARGIN`) | Aviso temprano |
+| Cooldown | 10 s | `alarm_fsm` (`COOL_S`) | Evita que la alarma oscile |
+| Calibración | −18 dB | `sonovigia_top` (`CAL_DB`) | Ver *Calibración* |
+| Registro | 86,400 × 8 bits | `lvl_log` | 24 h de niveles de 1 s |
+| UART | 115200 8N1 | `uart_tx`, `uart_rx` | Estándar de terminales serie |
+
+### La máquina de estados de la alarma
+
+`alarm_fsm` es una máquina **Moore**: sus salidas dependen solo del estado, así que los LED y el buzzer quedan estables. Se evalúa 8 veces por segundo, con cada nivel nuevo.
+
+```mermaid
+stateDiagram-v2
+    [*] --> MONITOR
+    MONITOR --> PRE_ALERTA: nivel ≥ límite − 3 dB
+    PRE_ALERTA --> MONITOR: nivel < límite − 3 dB
+    PRE_ALERTA --> ALERTA: nivel ≥ límite durante 3 s seguidos
+    ALERTA --> COOLDOWN: nivel < límite
+    COOLDOWN --> ALERTA: nivel ≥ límite
+    COOLDOWN --> MONITOR: 10 s por debajo del límite
 ```
-A0 → ADC 12b 1 MS/s → adc_if → cic_dec ÷40 → dc_block → a_weight_iir → ms_avg → db_lut ─┬→ alarm_fsm → HEX4 / buzzer_ctrl
-                                                                                         ├→ led_bar (LEDR), disp_ctrl (HEX), peak_hold
-                                                                                         └→ lvl_log (24 h) → log_uart → uart_tx (IO1)
-tick_gen → tod_clock (hora + límite 55/50/100)        uart_rx (IO0) → comando 'D' (descarga)
-```
+
+### Cálculo del nivel sin logaritmos
+
+La señal pasa primero por un decimador CIC de 3 etapas, que solo usa sumas y restas:
+
+$$H(z) = \left(\frac{1 - z^{-40}}{1 - z^{-1}}\right)^{3}$$
+
+Después, un pasa-altas de un polo quita los 2.5 V de polarización del micrófono. Se multiplica por $R$ con corrimientos, sin multiplicador:
+
+$$y[n] = x[n] - x[n-1] + R\,y[n-1], \qquad R = 1 - 2^{-9} - 2^{-11} \approx 0.99756,\quad f_c \approx 9.7\ \text{Hz}$$
+
+La ponderación A (orden 6) son 4 pasa-altas de primer orden más un biquad, que también compensa la caída del CIC. Todo usa **un solo multiplicador 18×18 compartido** en 9 pasos por muestra. Por último, `db_lut` encuentra el nivel por búsqueda binaria en una ROM de umbrales (8 pasos):
+
+$$\text{raw} = \operatorname{round}\!\left(10\log_{10}\sum y^{2}\right), \qquad \text{nivel} = \text{raw} + \text{CAL} + \text{trim}$$
+
+donde CAL es el parámetro `CAL_DB` y trim viene de SW9–SW7.
+
+## Arquitectura
+
+### Módulos
 
 | Módulo | Función |
 |---|---|
-| `rst_sync` | Reset de KEY0: entra asíncrono, sale sincronizado |
-| `adc_if` | Comando continuo al IP del ADC + cruce de dominio (toggle sync) + detector de recorte |
+| `sonovigia_top` | Nivel superior: conecta todos los módulos con los pines de la DE10-Lite |
+| `adc_qsys` | Envoltura del ADC: un PLL (`altpll`, 10 → 10 MHz) más el IP `adc_core` (Modular ADC) |
+| `adc_if` | Comando continuo al ADC, cruce de dominio 10 → 50 MHz (*toggle synchronizer*) y detector de recorte |
 | `adc_model` | **Solo simulación**: senoidal configurable en lugar del IP |
-| `cic_dec` | CIC 3 etapas ÷40 (28 bits internos, salida 16 bits, ganancia 15.625) |
-| `dc_block` | Pasa-altas de 1 polo, fc = 9.7 Hz, sin multiplicador |
-| `a_weight_iir` | Ponderación A, orden 6, **un multiplicador compartido** (FSM de 15 ciclos) |
+| `cic_dec` | CIC de 3 etapas ÷40, 28 bits internos, salida de 16 bits |
+| `dc_block` | Pasa-altas de un polo, fc = 9.7 Hz, sin multiplicador |
+| `a_weight_iir` | Ponderación A de orden 6 con un multiplicador compartido |
 | `ms_avg` | Σy² por bloque de 125 ms (Fast) y suma móvil de 1 s (Slow) |
-| `db_lut` | Σy² → dB por búsqueda binaria en ROM + calibración |
-| `tod_clock` | Reloj HH:MM:SS, límite día/noche/evento (4 h) |
-| `alarm_fsm` | Moore: MONITOR → PRE → ALERTA → COOLDOWN, sostén configurable |
-| `peak_hold` | Lmax |
-| `disp_ctrl` | 6 displays (usa `hex7seg` y `bin2bcd`) |
-| `lvl_log` | Anillo de 86,400 × 8 bits en M9K (24 h de niveles de 1 s) |
-| `uart_tx`, `uart_rx`, `log_uart` | Línea CSV por segundo y descarga del registro |
-| `buzzer_ctrl` | Pitido 0.5 s / 0.5 s en ALERTA, silenciable |
-| `sonovigia_top` | Nivel superior con nombres de puertos del System Builder |
+| `db_lut` | Σy² → dB por búsqueda binaria en ROM, más calibración |
+| `tod_clock` | Reloj HH:MM:SS y selección del límite día / noche / evento |
+| `alarm_fsm` | Máquina Moore MONITOR → PRE-ALERTA → ALERTA → COOLDOWN |
+| `peak_hold` | Nivel máximo (Lmax) |
+| `led_bar` | Barra termómetro en LEDR |
+| `disp_ctrl`, `bin2bcd`, `hex7seg` | Seis displays de 7 segmentos (activos en bajo) |
+| `buzzer_ctrl` | Tono de 2 kHz, 0.5 s sí / 0.5 s no, durante la alerta |
+| `lvl_log` | Buffer circular de 86,400 bytes en M9K (24 h) |
+| `log_uart`, `uart_tx`, `uart_rx` | Línea CSV por segundo y descarga del registro con el comando `D` |
+| `tick_gen`, `rst_sync`, `io_sync` | Pulsos de 1 Hz y 4 Hz, reset sincronizado y sincronizadores de entradas |
 
-## Controles
+### Relojes
 
-| Control | Función |
-|---|---|
-| KEY0 | Reset |
-| KEY1 | En modo reloj: +1 hora (SW6 = 0) o +1 minuto (SW6 = 1). En otro modo: borra Lmax y silencia la alerta |
-| SW[1:0] | 00 auto día/noche · 01 día (55) · 10 noche (50) · 11 evento (100 dB, 4 h) |
-| SW2 | 0 Fast (125 ms) · 1 Slow (1 s) |
-| SW3 | Habilita buzzer |
-| SW[5:4] | Display: 00 nivel · 01 Lmax · 10 reloj · 11 raw (calibración) |
-| SW[9:7] | Ajuste fino de calibración −4…+3 dB |
+Todo el procesamiento corre con **MAX10_CLK1_50 (50 MHz)**. La lógica lenta usa pulsos de habilitación (`tick_gen`), no relojes derivados. El ADC usa **ADC_CLK_10** a través de un PLL, porque el IP Modular ADC lo exige, y `adc_if` hace el único cruce de dominio del diseño.
 
-Displays: **HEX5** límite (`d`/`n`/`E`), **HEX4** alarma (`-`/`P`/`A` parpadeando/`C`), **HEX3** `o` = ADC saturado, **HEX2–0** valor.
+### Salida serie (opcional)
 
-## Simulación en Active-HDL
+Con un adaptador USB-serie de 3.3 V (TX → IO0, RX → IO1, GND común) a 115200 8N1, la tarjeta envía una línea por segundo:
 
-1. Crea un diseño nuevo y agrega todos los archivos de `rtl/` y `tb/`.
-2. Define la macro `SIMULATION` (Design Settings → Verilog → Macros, o `alog +define+SIMULATION`). Sin ella, `sonovigia_top` busca el IP real `adc_qsys`.
-3. Compila todo y simula cada testbench:
-   ```
-   alog -dbg +define+SIMULATION rtl/*.v tb/*.v
-   asim +access +r cic_dec_tb
-   run -all
-   ```
-4. Orden sugerido: `tick_gen` … `led_bar` → `cic_dec` → `dc_block` → `a_weight_iir` → `ms_avg` → `db_lut` → `adc_if` → `tod_clock` → `alarm_fsm` → `disp_ctrl` → `lvl_log` → `uart_loop` → `log_uart` → `buzzer_ctrl` → `sonovigia_top`.
-5. `sonovigia_top_tb` simula 1.3 s (≈65 M ciclos) y puede tardar minutos. Define también `QUICK` para detenerlo en 0.4 s.
+```
+12:00:01,048,M
+12:00:02,051,M
+12:00:03,057,P
+```
 
-Los TB de `cic_dec`, `dc_block`, `a_weight_iir`, `ms_avg` y `db_lut` los genera `model/gen_golden_tb.py` y comparan **bit a bit** contra el modelo Python. Si alguno falla, anota la primera línea de `ERROR`.
+Formato: `HH:MM:SS,nivel,estado` (M monitor, P pre-alerta, A alerta, C cooldown). Al enviar `D` se descarga el registro de 24 h, que termina con `END`.
 
-## Implementación en Quartus
+## Resultados
 
-1. **IP del ADC (lo más seguro):** copia `adc_qsys.qsys` del demo `Demonstrations/ADC_RTL` del System CD de la DE10-Lite, que ya está probado en esta tarjeta. Ábrelo en Platform Designer, confirma el modo *ADC control core only* con el canal 1 habilitado y genera el HDL. Agrega `adc_qsys/synthesis/adc_qsys.qip` al proyecto.
-2. **Revisa los nombres de puertos** del IP en `adc_qsys_inst.v` y, si difieren, ajusta la instancia en `sonovigia_top.v`. También confirma con el demo que Arduino A0 es el canal 1 (`ADC_CH`).
-3. Agrega `rtl/*.v` **excepto `adc_model.v`**, más `quartus/sonovigia.sdc`. Ejecuta `quartus/sonovigia_pins.tcl` (Tools → Tcl Scripts). Ese script define el dispositivo, el top, el SDC y los 90 pines con su estándar de E/S.
-4. Compila y revisa:
-   - TimeQuest sin violaciones a 50 MHz;
-   - unos 87 de 182 bloques M9K para el registro;
-   - 2 multiplicadores 18×18.
-5. Con Signal Tap, verifica que `u_adc_if/s_valid` llegue a ~1 MHz. Si la tasa real difiere, la curva A se desplaza en frecuencia.
+### Modelo de referencia (`model/eval_chain.py`)
 
-## Calibración (un punto)
-
-1. Pon SW[5:4] = 11 (raw) y SW2 = 1 (Slow).
-2. Aplica una referencia: un calibrador de 94 dB a 1 kHz, o ruido estable medido al lado con un sonómetro Clase 2.
-3. Calcula `CAL_DB = L_referencia − raw` y ponlo como parámetro de `sonovigia_top`. SW[9:7] da ±4 dB de ajuste fino sin recompilar.
-4. Ajusta la ganancia del preamplificador de modo que el ruido más fuerte esperado no encienda la `o` de sobrecarga.
-
-Con `CAL_DB = −18` (valor por defecto), un tono de 1 kHz a escala completa del ADC se lee como 110 dB.
-
-## UART
-
-Usa un adaptador USB-serie de **3.3 V**:
-- TX del adaptador → Arduino IO0;
-- RX del adaptador → IO1;
-- GND común.
-
-Configura 115200 8N1.
-- Cada segundo llega una línea `HH:MM:SS,LLL,S`.
-- Al enviar `D` se descarga el registro (`LLL` por línea, del más viejo al más nuevo) y termina con `END`. Las 24 h tardan ≈37 s.
-
-## Resultados del modelo (`model/eval_chain.py`)
+Un modelo en Python, exacto al bit, reproduce la cadena completa y genera los vectores de prueba de los testbenches.
 
 | Prueba | Resultado |
 |---|---|
-| Linealidad a 1 kHz, 0 a −60 dBFS | error ≤ +0.18 dB (redondeo a 1 dB) |
-| Curva A, 31.5 Hz–10 kHz (incluye CIC y DC-block) | ≤ 0.4 dB (31.5 Hz); ≤ 0.04 dB desde 125 Hz |
-| Piso de ruido (ruido de ADC σ = 1 LSB) | raw ≈ 49, frente a 128 a escala completa (≈79 dB de rango) |
-| Máximo interno (tono a escala completa) | 79,824 de 131,071 (sin saturar) |
+| Linealidad a 1 kHz, de 0 a −60 dBFS | Error ≤ +0.18 dB (redondeo a 1 dB) |
+| Curva A de 31.5 Hz a 10 kHz (incluye CIC y DC-block) | ≤ 0.4 dB a 31.5 Hz; ≤ 0.04 dB desde 125 Hz |
+| Piso de ruido (ruido del ADC σ = 1 LSB) | raw ≈ 49, frente a 128 a escala completa (≈79 dB de rango) |
+| Máximo interno con un tono a escala completa | 79,824 de 131,071 (sin saturar) |
 
-## Diferencias respecto al reporte (para actualizarlo)
+### Simulación
 
-| Reporte | Implementación | Motivo |
+Hay 19 testbenches autoverificables en `tb/` que imprimen `PASS` / `FAIL`. Los de `cic_dec`, `dc_block`, `a_weight_iir`, `ms_avg` y `db_lut` comparan bit a bit contra el modelo de Python.
+
+| Testbench | Qué verifica | Resultado |
 |---|---|---|
-| 3 biquads Q1.17 | 4 secciones de 1er orden + 1 biquad, Q2.16 | Mismo orden 6, 9 multiplicaciones por muestra en lugar de 15; error de polo lineal; b0 = 1.31 > 1 requiere Q2.x |
-| Acumulador de 40 bits | 48 bits | 3125 × y² necesita 46 bits |
-| 1 multiplicador | 2 (filtro + cuadrado) | Simplicidad; son 2 de 144 |
-| Slow = 1 s | Suma móvil de 8 bloques de 125 ms | Se actualiza cada 125 ms; en cada segundo exacto es el LAeq,1s |
-| — | Compensación de la caída del CIC en el biquad | Error < 0.02 dB hasta 10 kHz |
+| `tick_gen_tb`, `io_sync_tb`, `hex7seg_tb`, `bin2bcd_tb`, `led_bar_tb` | Bloques básicos | _[PASS / FAIL]_ |
+| `cic_dec_tb`, `dc_block_tb`, `a_weight_iir_tb`, `ms_avg_tb`, `db_lut_tb` | Cadena de señal contra el modelo | _[PASS / FAIL]_ |
+| `adc_if_tb` | Cruce de dominio y recorte | _[PASS / FAIL]_ |
+| `tod_clock_tb`, `alarm_fsm_tb` | Reloj, límites y alarma | _[PASS / FAIL]_ |
+| `disp_ctrl_tb` | Displays | _[PASS / FAIL]_ |
+| `lvl_log_tb`, `uart_loop_tb`, `log_uart_tb`, `buzzer_ctrl_tb` | Registro, UART y buzzer | _[PASS / FAIL]_ |
+| `sonovigia_top_tb` | Sistema completo con `adc_model` (1.3 s) | _[PASS / FAIL]_ |
+
+### Síntesis (Quartus Prime Lite 21.1)
+
+El diseño compila sin errores para el 10M50DAF484C7G. Los valores siguientes salen de *Compilation Report → Flow Summary* y *Timing Analyzer*.
+
+| Recurso | Usado | Disponible | Nota |
+|---|---|---|---|
+| Elementos lógicos | _[ ]_ | 49,760 | |
+| Bits de memoria (M9K) | _[ ]_ | 1,677,312 | ≈ 691 kbit son del registro de 24 h |
+| Multiplicadores de 9 bits | _[ ]_ | 288 | ≈ 2 de 18×18: filtro A y cuadrado |
+| PLL | 1 | 4 | Reloj del ADC |
+| Fmax de MAX10_CLK1_50 | _[ ] MHz_ | requerido 50 MHz | Slow 1200 mV 85 °C |
+
+### En la tarjeta
+
+| Prueba | Resultado |
+|---|---|
+| Programación por JTAG, CONF_DONE encendido | Funciona |
+| Displays, LEDR y switches responden | Funciona |
+| Nivel en silencio y con aplauso; Lmax con KEY1 | _[completar]_ |
+| Alarma: P → A → C → monitor | _[completar]_ |
+| Sobrecarga (`o` en HEX3) con ganancia alta | _[completar]_ |
+| Calibración contra referencia | _[completar: CAL_DB final y error]_ |
+
+## Cómo reproducirlo
+
+Se necesita Quartus Prime Lite 21.1 con soporte de MAX 10, una DE10-Lite con su cable USB, un módulo MAX4466 y tres jumpers.
+
+1. **Generar el IP del ADC una vez.** En Quartus abre *Tools → IP Catalog → Modular ADC core Intel FPGA IP*, con nombre `adc_core`, *ADC control core only*, reloj de 10 MHz, 1 MHz de muestreo, referencia interna y solo el canal 1 (A0). Después *Generate HDL* (Verilog) y agrega `adc_core.qsys` al proyecto.
+2. **Agregar las fuentes.** Todos los `.v` de `rtl/` **excepto** `adc_model.v`, más `quartus/sonovigia.sdc`. El top es `sonovigia_top`.
+3. **Asignar pines.** *Assignments → Import Assignments* → `quartus/sonovigia_pins.qsf`, o ejecuta `quartus/sonovigia_pins.tcl` en *Tools → Tcl Scripts*.
+4. **Compilar y programar.** *Processing → Start Compilation*; luego *Tools → Programmer* → `output_files/sonovigia.sof`. Para que el diseño quede guardado al apagar, programa `sonovigia.pof` (modo *Single Uncompressed Image with Memory Initialization*).
+
+Simulación en Active-HDL (la macro `SIMULATION` cambia el IP por `adc_model`):
+
+```
+alog -dbg +define+SIMULATION rtl/*.v tb/*.v
+asim +access +r cic_dec_tb
+run -all
+```
+
+Regenerar coeficientes, ROM y testbenches desde el modelo:
+
+```
+python model/design_aweight.py
+python model/gen_db_lut.py
+python model/gen_golden_tb.py
+python model/eval_chain.py
+```
+
+### Calibración (un punto)
+
+1. Pon SW5 SW4 = 11 (raw), SW2 = 1 (Slow) y SW9–SW7 = 000.
+2. Mide un ruido estable con un sonómetro de referencia junto al micrófono.
+3. Calcula `CAL_DB = L_referencia − raw`, cámbialo en `sonovigia_top.v` y recompila. SW9–SW7 permiten un ajuste fino de −4 a +3 dB sin recompilar.
+
+## Estructura del repositorio
+
+```
+rtl/                    24 módulos Verilog (sintetizables, salvo adc_model.v)
+  sonovigia_top.v       nivel superior
+  adc_qsys.v            PLL + IP adc_core
+  ...
+tb/                     19 testbenches autoverificables (PASS / FAIL)
+model/                  modelo de referencia en Python y generadores
+  chain_model.py        cadena completa, exacta al bit
+  design_aweight.py     coeficientes del filtro A
+  gen_db_lut.py         ROM de umbrales de db_lut.v
+  gen_golden_tb.py      testbenches contra el modelo
+  eval_chain.py         linealidad, curva A y piso de ruido
+  gen_pins.py           genera el QSF y el TCL de pines
+quartus/
+  sonovigia.sdc         restricciones de tiempo
+  sonovigia_pins.qsf    90 pines para Import Assignments
+  sonovigia_pins.tcl    los mismos pines como script
+docs/                   propuesta, reporte y guías en PDF
+```
+
+`adc_core.qsys` y la carpeta `adc_core/` los genera Quartus en el paso 1 de *Cómo reproducirlo*.
+
+## Límites y trabajo futuro
+
+**Límites**
+
+- **Sin certificación.** El MAX4466 no es un micrófono de medición; los valores son aproximados hasta calibrar contra un sonómetro Clase 2.
+- **Rango.** Con 5 V, el módulo recorta cerca de 100–115 dB según la ganancia, y por debajo de ~45 dB domina el ruido del ADC.
+- **Datos volátiles.** La hora, el Lmax y el registro de 24 h se pierden al apagar, porque viven en la memoria interna.
+- **Medición en un punto.** La NOM-081 mide en el límite del predio con un procedimiento formal; este equipo solo da una referencia objetiva.
+- **Simulación pendiente.** _[actualizar cuando se corran todos los testbenches en Active-HDL]_
+
+**Trabajo futuro**
+
+- **Registro persistente.** Guardar el log en la SDRAM de 64 MB o en la flash de usuario (UFM).
+- **Reloj real.** Agregar un RTC con batería para no ajustar la hora al encender.
+- **Análisis por bandas.** Agregar una FFT para identificar el tipo de ruido (música, tráfico, voces).
+- **Conectividad.** Enviar alertas a un teléfono mediante un módulo inalámbrico.
+- **Validación.** Comparar contra un sonómetro Clase 2 en varias frecuencias y niveles.
+
+## Documentos
+
+- [Propuesta del proyecto final](docs/Propuesta_Proyecto_Final_SonoVigia_FPGA.pdf)
+- [Reporte: soluciones embebidas para retos sociales](docs/SonoVigia_FPGA_Social_Challenges_Report.pdf)
+- [Guía de conexión y pasos con Quartus 21.1](docs/SonoVigia_Pasos_Kit_Minimo_Quartus21.pdf)
+- [Manual de usuario de la DE10-Lite (Terasic)](http://de10-lite.terasic.com/)
